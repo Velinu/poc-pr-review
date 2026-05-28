@@ -1,5 +1,6 @@
-import { Injectable } from '@nestjs/common';
-import axios, { AxiosInstance } from 'axios';
+import { Injectable, Logger } from '@nestjs/common';
+import axios, { AxiosError, AxiosInstance } from 'axios';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { createAgent, tool } from 'langchain';
 import * as z from 'zod';
 import { CreatePrDto } from './dto/create-pr.dto.js';
@@ -8,11 +9,19 @@ import { AGENT_SYSTEM_PROMPT } from './prompts/agent.prompt.js';
 
 @Injectable()
 export class ReviewService {
+  private readonly logger = new Logger(ReviewService.name);
   private github: AxiosInstance;
   private owner: string;
 
+  private createModel() {
+    return new ChatGoogleGenerativeAI({
+      model: 'gemini-2.5-flash-lite',
+      apiKey: process.env.GOOGLE_API_KEY,
+    });
+  }
+
   constructor() {
-    this.owner = process.env.USER!;
+    this.owner = process.env.GITHUB_OWNER!;
     this.github = axios.create({
       baseURL: 'https://api.github.com',
       headers: {
@@ -23,194 +32,184 @@ export class ReviewService {
     });
   }
 
+  private handleAxiosError(context: string, error: unknown) {
+    const axiosError = error as AxiosError;
+    const status = axiosError.response?.status;
+    const details = axiosError.response?.data;
+    this.logger.error(`[${context}] ${axiosError.message}`, JSON.stringify(details));
+    return { error: axiosError.message, status, details };
+  }
+
   async createPullRequest(dto: CreatePrDto) {
-    const github = this.github;
     const owner = this.owner;
 
-    const compareBranches = tool(
-      async (input: { repo: string; head: string; base: string }) => {
-        const { data } = await github.get(
-          `/repos/${owner}/${input.repo}/compare/${input.base}...${input.head}`,
-        );
-
-        return JSON.stringify({
-          commits: data.commits.map((commit: any) => ({
-            message: commit.commit.message,
-            author: commit.commit.author.name,
-          })),
-          files: data.files.map((file: any) => ({
-            filename: file.filename,
-            status: file.status,
-            additions: file.additions,
-            deletions: file.deletions,
-            patch: file.patch?.slice(0, 2000),
-          })),
-        });
-      },
-      {
-        name: 'compare_branches',
-        description: 'Compare two branches and get commits and file diffs',
-        schema: z.object({
-          repo: z.string().describe('Repository name'),
-          head: z.string().describe('Source branch'),
-          base: z.string().describe('Target branch'),
-        }),
-      },
-    );
+    let comparison: { commits: any[]; files: any[] };
+    try {
+      const { data } = await this.github.get(
+        `/repos/${owner}/${dto.repo}/compare/${dto.base}...${dto.head}`,
+      );
+      comparison = {
+        commits: data.commits.map((commit: any) => ({
+          message: commit.commit.message,
+          author: commit.commit.author.name,
+        })),
+        files: data.files.map((file: any) => ({
+          filename: file.filename,
+          status: file.status,
+          additions: file.additions,
+          deletions: file.deletions,
+          patch: file.patch?.slice(0, 2000),
+        })),
+      };
+    } catch (error) {
+      return this.handleAxiosError('compare_branches', error);
+    }
 
     const createPr = tool(
-      async (input: {
-        repo: string;
-        title: string;
-        body: string;
-        head: string;
-        base: string;
-      }) => {
-        const { data } = await github.post(`/repos/${owner}/${input.repo}/pulls`, {
-          title: input.title,
-          body: input.body,
-          head: input.head,
-          base: input.base,
-        });
+      async (input: { title: string; body: string }) => {
+        try {
+          const { data } = await this.github.post(`/repos/${owner}/${dto.repo}/pulls`, {
+            title: input.title,
+            body: input.body,
+            head: dto.head,
+            base: dto.base,
+          });
 
-        return JSON.stringify({
-          number: data.number,
-          url: data.html_url,
-          title: data.title,
-        });
+          return JSON.stringify({ number: data.number, url: data.html_url, title: data.title });
+        } catch (error) {
+          const axiosError = error as AxiosError;
+          this.logger.error(
+            `[create_pull_request] ${axiosError.message}`,
+            JSON.stringify(axiosError.response?.data),
+          );
+          throw error;
+        }
       },
       {
         name: 'create_pull_request',
         description: 'Create a pull request on GitHub with the given title and body',
         schema: z.object({
-          repo: z.string().describe('Repository name'),
           title: z.string().describe('Pull request title'),
           body: z.string().describe('Pull request description in markdown'),
-          head: z.string().describe('Source branch'),
-          base: z.string().describe('Target branch'),
         }),
       },
     );
 
     const agent = createAgent({
-      model: 'google-genai:gemini-2.5-flash-lite',
-      tools: [compareBranches, createPr],
+      model: this.createModel(),
+      tools: [createPr],
       systemPrompt: AGENT_SYSTEM_PROMPT,
     });
 
-    return agent.invoke({
-      messages: [
-        {
-          role: 'user',
-          content: `Analyze branch "${dto.head}" against "${dto.base}" in ${owner}/${dto.repo}.
+    return agent.invoke(
+      {
+        messages: [
+          {
+            role: 'user',
+            content: `Create a pull request for the branch "${dto.head}" → "${dto.base}" in ${owner}/${dto.repo}.
 
-1. Call compare_branches to get commits and file diffs
-2. Generate a concise PR title and a detailed markdown description (summary, what changed and why, modified files, reviewer notes)
-3. Call create_pull_request with the generated content
+Here is the comparison data between the branches:
+${JSON.stringify(comparison, null, 2)}
+
+Based on this data:
+1. Generate a concise PR title and a detailed markdown description (summary, what changed and why, modified files, reviewer notes)
+2. Call create_pull_request with the generated content
 
 Write the description in the same language as the commit messages.`,
-        },
-      ],
-    });
+          },
+        ],
+      },
+      { recursionLimit: 5 },
+    );
   }
 
   async reviewPullRequest(dto: ReviewPrDto) {
-    const github = this.github;
     const owner = this.owner;
 
-    const getPrDetails = tool(
-      async (input: { repo: string; pull_number: number }) => {
-        const { data } = await github.get(
-          `/repos/${owner}/${input.repo}/pulls/${input.pull_number}`,
-        );
+    let prDetails: any;
+    let prFiles: any[];
+    try {
+      const [detailsResponse, filesResponse] = await Promise.all([
+        this.github.get(`/repos/${owner}/${dto.repo}/pulls/${dto.pull_number}`),
+        this.github.get(`/repos/${owner}/${dto.repo}/pulls/${dto.pull_number}/files`),
+      ]);
 
-        return JSON.stringify({
-          title: data.title,
-          body: data.body,
-          state: data.state,
-          user: data.user?.login,
-          created_at: data.created_at,
-          base: data.base?.ref,
-          head: data.head?.ref,
-          additions: data.additions,
-          deletions: data.deletions,
-          changed_files: data.changed_files,
-        });
-      },
-      {
-        name: 'get_pr_details',
-        description: 'Get details of a GitHub pull request',
-        schema: z.object({
-          repo: z.string().describe('Repository name'),
-          pull_number: z.number().describe('Pull request number'),
-        }),
-      },
-    );
+      const pr = detailsResponse.data;
+      prDetails = {
+        title: pr.title,
+        body: pr.body,
+        state: pr.state,
+        user: pr.user?.login,
+        created_at: pr.created_at,
+        base: pr.base?.ref,
+        head: pr.head?.ref,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        changed_files: pr.changed_files,
+      };
 
-    const getPrFiles = tool(
-      async (input: { repo: string; pull_number: number }) => {
-        const { data: files } = await github.get(
-          `/repos/${owner}/${input.repo}/pulls/${input.pull_number}/files`,
-        );
-
-        return JSON.stringify(
-          files.map((file: any) => ({
-            filename: file.filename,
-            status: file.status,
-            additions: file.additions,
-            deletions: file.deletions,
-            patch: file.patch?.slice(0, 2000),
-          })),
-        );
-      },
-      {
-        name: 'get_pr_files',
-        description: 'Get list of files changed in a pull request with their diffs',
-        schema: z.object({
-          repo: z.string().describe('Repository name'),
-          pull_number: z.number().describe('Pull request number'),
-        }),
-      },
-    );
+      prFiles = filesResponse.data.map((file: any) => ({
+        filename: file.filename,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        patch: file.patch?.slice(0, 2000),
+      }));
+    } catch (error) {
+      return this.handleAxiosError('get_pr_data', error);
+    }
 
     const postReviewComment = tool(
-      async (input: { repo: string; pull_number: number; body: string }) => {
-        const { data } = await github.post(
-          `/repos/${owner}/${input.repo}/issues/${input.pull_number}/comments`,
-          { body: input.body },
-        );
+      async (input: { body: string }) => {
+        try {
+          const { data } = await this.github.post(
+            `/repos/${owner}/${dto.repo}/issues/${dto.pull_number}/comments`,
+            { body: input.body },
+          );
 
-        return JSON.stringify({ comment_id: data.id, url: data.html_url });
+          return JSON.stringify({ comment_id: data.id, url: data.html_url });
+        } catch (error) {
+          const axiosError = error as AxiosError;
+          this.logger.error(
+            `[post_review_comment] ${axiosError.message}`,
+            JSON.stringify(axiosError.response?.data),
+          );
+          throw error;
+        }
       },
       {
         name: 'post_review_comment',
         description: 'Post a review comment on a pull request',
         schema: z.object({
-          repo: z.string().describe('Repository name'),
-          pull_number: z.number().describe('Pull request number'),
           body: z.string().describe('The review comment content in markdown'),
         }),
       },
     );
 
     const agent = createAgent({
-      model: 'google-genai:gemini-2.5-flash-lite',
-      tools: [getPrDetails, getPrFiles, postReviewComment],
+      model: this.createModel(),
+      tools: [postReviewComment],
       systemPrompt: AGENT_SYSTEM_PROMPT,
     });
 
-    return agent.invoke({
-      messages: [
-        {
-          role: 'user',
-          content: `Review PR #${dto.pull_number} in ${owner}/${dto.repo}.
+    return agent.invoke(
+      {
+        messages: [
+          {
+            role: 'user',
+            content: `Review PR #${dto.pull_number} in ${owner}/${dto.repo}.
 
-1. Call get_pr_details to get the PR context
-2. Call get_pr_files to analyze changed files and diffs
-3. Write a review covering code quality, bugs, security, performance, and improvements
-4. Call post_review_comment to publish the review as a comment on the PR`,
-        },
-      ],
-    });
+PR details:
+${JSON.stringify(prDetails, null, 2)}
+
+Changed files:
+${JSON.stringify(prFiles, null, 2)}
+
+Write a review covering code quality, bugs, security, performance, and improvements, then call post_review_comment to publish it.`,
+          },
+        ],
+      },
+      { recursionLimit: 5 },
+    );
   }
 }
